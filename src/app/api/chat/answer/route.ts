@@ -88,7 +88,8 @@ function shouldEscalateBeforeLlm(
   const covered = Array.from(queryTokens).filter((token) => contextTokens.has(token));
   const coverage = queryTokens.size ? covered.length / queryTokens.size : 1;
 
-  if (coverage < 0.35 && topScore < 0.5) {
+  // A single generic overlap should not make an unrelated question look reliable.
+  if (coverage < 0.5 || (coverage < 0.7 && topScore < 0.5)) {
     return true;
   }
 

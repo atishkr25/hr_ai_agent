@@ -94,20 +94,41 @@ const SEED_CHUNKS: PolicyChunk[] = [
   },
 ];
 
-// Load from disk, fall back to seed data
-let POLICY_CHUNKS: PolicyChunk[] = readStore<PolicyChunk>(SEED_CHUNKS);
+// Load from MongoDB, fall back to seed data
+let POLICY_CHUNKS: PolicyChunk[] = [...SEED_CHUNKS];
+let initialized = false;
 
-// If store was empty, seed it
-if (POLICY_CHUNKS.length === 0) {
-  POLICY_CHUNKS = [...SEED_CHUNKS];
-  writeStore(POLICY_CHUNKS);
+// Initialize policies from MongoDB on first request
+async function ensureInitialized(): Promise<void> {
+  if (initialized) return;
+  
+  try {
+    const chunks = await readStore<PolicyChunk>(SEED_CHUNKS);
+    POLICY_CHUNKS = chunks;
+    initialized = true;
+    console.log(`[policies] Initialized with ${POLICY_CHUNKS.length} chunks from MongoDB`);
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.error("[policies] Failed to initialize from MongoDB:", errorMsg);
+    console.log("[policies] Using seed data as fallback");
+    POLICY_CHUNKS = [...SEED_CHUNKS];
+    initialized = true;
+  }
 }
+
+// Initialize on module load (non-blocking)
+ensureInitialized().catch((err) => {
+  console.error("[policies] Initialization error:", err);
+});
 
 export function listPolicies(): PolicyChunk[] {
   return POLICY_CHUNKS;
 }
 
-export function upsertPolicyChunk(chunk: PolicyChunk): PolicyChunk {
+export async function upsertPolicyChunk(chunk: PolicyChunk): Promise<PolicyChunk> {
+  // Ensure initialized before upserting
+  await ensureInitialized();
+  
   const existingIndex = POLICY_CHUNKS.findIndex((item) => item.id === chunk.id);
 
   if (existingIndex >= 0) {
@@ -116,6 +137,10 @@ export function upsertPolicyChunk(chunk: PolicyChunk): PolicyChunk {
     POLICY_CHUNKS.push(chunk);
   }
 
-  writeStore(POLICY_CHUNKS); // persist to disk
+  // Persist to MongoDB (non-blocking)
+  writeStore(POLICY_CHUNKS).catch((err) => {
+    console.error("[policies] Failed to persist to MongoDB:", err);
+  });
+
   return POLICY_CHUNKS[existingIndex >= 0 ? existingIndex : POLICY_CHUNKS.length - 1];
 }

@@ -167,7 +167,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const baseUrl = req.nextUrl.origin;
+    const baseUrl = req.nextUrl.origin || process.env.VERCEL_URL 
+      ? `https://${process.env.VERCEL_URL}` 
+      : "http://localhost:3000";
     let upserted = 0;
     const errors: string[] = [];
 
@@ -194,10 +196,11 @@ export async function POST(req: NextRequest) {
         if (response.ok) {
           upserted += 1;
         } else {
-          errors.push(`Chunk ${chunk.id} failed`);
+          const errorData = await response.text();
+          errors.push(`Chunk ${chunk.id}: ${response.status} - ${errorData}`);
         }
-      } catch {
-        errors.push(`Chunk ${chunk.id} error`);
+      } catch (err) {
+        errors.push(`Chunk ${chunk.id}: ${err instanceof Error ? err.message : "Unknown error"}`);
       }
     }
 
@@ -227,9 +230,10 @@ export async function POST(req: NextRequest) {
       status,
     });
   } catch (error) {
-    console.error("[ingest] error:", error);
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.error("[ingest] error:", errorMsg);
     return NextResponse.json(
-      { error: "Ingestion failed. Please try again." },
+      { error: `Ingestion failed: ${errorMsg}` },
       { status: 500 },
     );
   }

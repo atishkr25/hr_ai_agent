@@ -61,7 +61,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const updated = upsertPolicyChunk(chunk);
+  const updated = await upsertPolicyChunk(chunk);
 
   writeAuditEvent({
     type: "policy_update",

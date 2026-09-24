@@ -11,7 +11,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { Citation, PolicyChunk, UserRole } from "@/lib/chat/types";
+import type { Citation, PolicyChunk, SessionUser, UserRole } from "@/lib/chat/types";
 
 type ChatMessage = {
   id: string;
@@ -111,14 +111,16 @@ function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-export default function ChatInterface() {
+export default function ChatInterface({ user }: { user: SessionUser }) {
   const router = useRouter();
+  // Only HR admins may preview other roles; everyone else chats as their account role.
+  const canSwitchRole = user.role === "hr_admin";
   // Each page load starts a fresh server-side conversation so earlier
   // sessions' history is never fed back to the model as context.
   const [initialConversation] = useState(createConversation);
   const [conversations, setConversations] = useState<Conversation[]>([initialConversation]);
   const [conversationId, setConversationId] = useState(initialConversation.id);
-  const [role, setRole] = useState<UserRole>("employee");
+  const [role, setRole] = useState<UserRole>(user.role);
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
@@ -198,9 +200,12 @@ export default function ChatInterface() {
 
   async function logout() {
     try {
-      await fetch("/api/auth/logout", { method: "POST" });
+      await fetch(user.role === "hr_admin" ? "/api/auth/logout" : "/api/auth/employee/logout", {
+        method: "POST",
+      });
     } finally {
-      router.push("/");
+      router.replace(user.role === "hr_admin" ? "/" : "/login");
+      router.refresh();
     }
   }
 
@@ -245,7 +250,7 @@ export default function ChatInterface() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-user-role": role,
+          ...(canSwitchRole ? { "x-user-role": role } : {}),
         },
         body: JSON.stringify({
           query: trimmed,
@@ -254,6 +259,10 @@ export default function ChatInterface() {
       });
 
       const answerData = (await answerResponse.json()) as AnswerResponse | { error: string };
+      if (answerResponse.status === 401) {
+        router.replace("/login");
+        return;
+      }
       if (!answerResponse.ok || "error" in answerData) {
         throw new Error("error" in answerData ? answerData.error : "Unable to generate policy answer.");
       }
@@ -332,9 +341,9 @@ export default function ChatInterface() {
         </div>
 
         <div className="flex items-center gap-3">
-          {process.env.NODE_ENV !== "production" ? (
+          {canSwitchRole ? (
             <div className="hidden items-center gap-2 md:flex">
-              <span className="text-[11px] text-[#8C8C95]">Role:</span>
+              <span className="text-[11px] text-[#8C8C95]">Preview as:</span>
               {(["employee", "manager", "hr_admin"] as UserRole[]).map((item) => (
                 <button
                   key={item}
@@ -352,11 +361,18 @@ export default function ChatInterface() {
             </div>
           ) : null}
 
+          <div className="hidden text-right leading-tight sm:block">
+            <p className="text-xs">{user.name}</p>
+            {user.email ? <p className="text-[10px] text-[#8C8C95]">{user.email}</p> : null}
+          </div>
           <span className="rounded-[999px] border border-[#1F1F21] px-2 py-1 text-[10px] text-[#8C8C95]">
-            {role}
+            {role.replace("_", " ")}
           </span>
-          <span className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-[#1F1F21] text-xs">
-            U
+          <span
+            title={user.email || user.name}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-[#1F1F21] text-xs uppercase"
+          >
+            {user.name.trim().charAt(0) || "U"}
           </span>
           <button
             type="button"
@@ -414,12 +430,14 @@ export default function ChatInterface() {
             );
           })}
 
-          <Link
-            href="/dashboard/admin"
-            className="mechanical mt-2 block rounded-[6px] border border-[#1F1F21] px-3 py-2 text-center text-xs text-[#8C8C95] hover:bg-[#1A1A1C]"
-          >
-            Open Admin Panel
-          </Link>
+          {user.role === "hr_admin" ? (
+            <Link
+              href="/dashboard/admin"
+              className="mechanical mt-2 block rounded-[6px] border border-[#1F1F21] px-3 py-2 text-center text-xs text-[#8C8C95] hover:bg-[#1A1A1C]"
+            >
+              Open Admin Panel
+            </Link>
+          ) : null}
         </aside>
 
         <section className="relative flex min-h-0 flex-col">
@@ -444,6 +462,7 @@ export default function ChatInterface() {
 
             {!currentConversation?.messages.length && !isStreaming ? (
               <div className="mx-auto mt-20 max-w-2xl text-center">
+                <p className="mb-2 text-sm text-[#8C8C95]">Hi {user.name.split(" ")[0]},</p>
                 <h2 className="text-2xl font-medium">What do you want to know about HR policy?</h2>
                 <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
                   {suggestionChips.map((chip) => (
@@ -529,7 +548,8 @@ export default function ChatInterface() {
 
                           {message.escalated ? (
                             <div className="mt-3 rounded-r-[6px] border-l-[3px] border-l-[#F59E0B] bg-[#1C1500] px-4 py-3 text-sm text-[#FCD34D]">
-                              This query has been flagged for HR review. Your HR team will follow up.
+                              This query has been flagged for HR review. Your HR team will reach out to you
+                              {user.email ? ` at ${user.email}` : ""}.
                               {message.ticketId ? (
                                 <span className="mono mt-1 block text-[10px] text-[#B8A15A]">
                                   Ticket {message.ticketId}

@@ -54,16 +54,16 @@ export default function Home() {
 
           <div className="mt-8 flex flex-wrap gap-3">
             <Link
-              href="/dashboard"
+              href="/login"
               className="mechanical rounded-[6px] bg-[#6366F1] px-5 py-3 text-sm text-white hover:opacity-90"
             >
-              Launch Chat
+              Employee Sign In
             </Link>
             <Link
               href="/dashboard/admin"
               className="mechanical rounded-[6px] border border-[#1F1F21] px-5 py-3 text-sm text-[#C2C2CA] hover:bg-[#1A1A1C]"
             >
-              Open Admin
+              HR Admin
             </Link>
           </div>
         </motion.div>

@@ -1,6 +1,6 @@
 import { MongoClient, type Collection, type Db, type Document } from "mongodb";
 import type { AuditEvent } from "./audit";
-import type { ConversationRecord, HrTicket, PolicyChunk } from "./types";
+import type { ConversationRecord, EmployeeAccount, HrTicket, PolicyChunk, PublicEmployee } from "./types";
 
 const MONGODB_URI = process.env.MONGODB_URI?.trim();
 const DATABASE_NAME = process.env.MONGODB_DB_NAME?.trim() || "hr-ai-agent";
@@ -286,4 +286,76 @@ export async function readIngestionHistory<T>(limit = 100): Promise<T[]> {
     console.error("[store] Failed to read ingestion history from MongoDB:", errorMsg);
     return [];
   }
+}
+
+let employeeIndexReady: Promise<unknown> | null = null;
+
+async function getEmployeesCollection(): Promise<Collection<Document>> {
+  const collection = await getCollection("employees");
+  employeeIndexReady ??= collection.createIndex({ email: 1 }, { unique: true }).catch((error) => {
+    employeeIndexReady = null;
+    throw error;
+  });
+  await employeeIndexReady;
+  return collection;
+}
+
+export class DuplicateEmailError extends Error {
+  constructor() {
+    super("An account with this email already exists.");
+  }
+}
+
+function toPublicEmployee(account: EmployeeAccount): PublicEmployee {
+  const copy: Partial<EmployeeAccount> = { ...account };
+  delete copy.passwordHash;
+  return copy as PublicEmployee;
+}
+
+export async function findEmployeeByEmail(email: string): Promise<EmployeeAccount | null> {
+  const collection = await getEmployeesCollection();
+  const document = await collection.findOne({ email });
+  return document ? withoutMongoId(document as unknown as EmployeeAccount & { _id?: unknown }) : null;
+}
+
+export async function insertEmployee(account: EmployeeAccount): Promise<void> {
+  const collection = await getEmployeesCollection();
+  try {
+    await collection.insertOne({ ...account } as unknown as Document);
+  } catch (error) {
+    if ((error as { code?: number }).code === 11000) {
+      throw new DuplicateEmailError();
+    }
+    throw error;
+  }
+}
+
+export async function recordEmployeeLogin(id: string): Promise<void> {
+  const collection = await getEmployeesCollection();
+  await collection.updateOne({ id }, { $set: { lastLoginAt: new Date().toISOString() } });
+}
+
+export async function listEmployees(limit = 500): Promise<PublicEmployee[]> {
+  const collection = await getEmployeesCollection();
+  const documents = (await collection
+    .find({})
+    .sort({ createdAt: -1 })
+    .limit(Math.max(1, Math.min(limit, 1000)))
+    .toArray()) as unknown as EmployeeAccount[];
+  return documents.map((document) => toPublicEmployee(withoutMongoId(document as EmployeeAccount & { _id?: unknown })));
+}
+
+export async function updateEmployeeRole(
+  id: string,
+  role: EmployeeAccount["role"],
+): Promise<PublicEmployee | null> {
+  const collection = await getEmployeesCollection();
+  const document = await collection.findOneAndUpdate(
+    { id },
+    { $set: { role, updatedAt: new Date().toISOString() } },
+    { returnDocument: "after" },
+  );
+  return document
+    ? toPublicEmployee(withoutMongoId(document as unknown as EmployeeAccount & { _id?: unknown }))
+    : null;
 }

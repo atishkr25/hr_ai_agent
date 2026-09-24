@@ -1,11 +1,11 @@
 import { NextResponse } from "next/server";
 import { writeAuditEvent } from "@/lib/chat/audit";
 import { answerPolicyQuestion } from "@/lib/chat/answer";
-import { getSessionRoleFromHeaders, resolveRoleFromRequest } from "@/lib/chat/role";
+import { getRequester, getSessionRoleFromHeaders, resolveRoleFromRequest } from "@/lib/chat/role";
 import { toPublicPolicyChunk } from "@/lib/chat/public";
 import { readConversation, upsertConversation, upsertHrTicket } from "@/lib/chat/store";
 import { notifyHrTicket } from "@/lib/notifications";
-import type { ConversationRecord, ConversationTurn, HrTicket, UserRole } from "@/lib/chat/types";
+import type { ConversationRecord, ConversationTurn, EmployeeContact, HrTicket, UserRole } from "@/lib/chat/types";
 
 type AnswerRequestBody = {
   query?: string;
@@ -14,6 +14,12 @@ type AnswerRequestBody = {
 };
 
 export async function POST(request: Request) {
+  const requester = getRequester(request);
+  if (!requester) {
+    return NextResponse.json({ error: "Please sign in to use the HR assistant." }, { status: 401 });
+  }
+  const employee: EmployeeContact = { id: requester.id, name: requester.name, email: requester.email };
+
   const role: UserRole = resolveRoleFromRequest(request, {
     allowAdminRoleOverride: true,
   });
@@ -35,8 +41,15 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Query is required." }, { status: 400 });
   }
 
-  const conversationId = body.conversationId?.trim() || `conv_${Date.now()}`;
-  const existingConversation = await readConversation(conversationId);
+  let conversationId = body.conversationId?.trim() || `conv_${Date.now()}`;
+  let existingConversation = await readConversation(conversationId);
+  // A conversation belongs to the person who started it; never load someone
+  // else's history into this user's context. Legacy records without an owner
+  // are treated the same way.
+  if (existingConversation && existingConversation.employee?.id !== requester.id) {
+    conversationId = `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    existingConversation = null;
+  }
   const history = existingConversation?.messages ?? [];
   const requestId = `req_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
   const response = await answerPolicyQuestion(query, role, history);
@@ -51,6 +64,7 @@ export async function POST(request: Request) {
       chunks: chunks.length,
       requestId,
       conversationId,
+      employeeEmail: employee.email,
       escalated: response.escalated,
       provider: response.provider,
       // Attribute the query to the policy actually cited in the answer.
@@ -78,6 +92,7 @@ export async function POST(request: Request) {
   const conversation: ConversationRecord = {
     id: conversationId,
     role,
+    employee,
     title: existingConversation?.title || query.slice(0, 72),
     messages: [...history, userTurn, assistantTurn].slice(-40),
     createdAt: existingConversation?.createdAt || now,
@@ -93,6 +108,7 @@ export async function POST(request: Request) {
       requestId,
       conversationId,
       role,
+      employee,
       question: query,
       answer,
       reason: response.escalationReason ?? "Low confidence or insufficient policy context.",
@@ -115,6 +131,8 @@ export async function POST(request: Request) {
         requestId,
         provider: response.provider,
         ticketId: ticket.id,
+        employeeName: employee.name,
+        employeeEmail: employee.email,
         ...(isEvaluation ? { evaluation: true } : {}),
       },
     });

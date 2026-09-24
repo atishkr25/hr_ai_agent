@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { writeAuditEvent } from "@/lib/chat/audit";
-import { resolveRoleFromRequest } from "@/lib/chat/role";
+import { getRequester, resolveRoleFromRequest } from "@/lib/chat/role";
 import { listPoliciesAsync, upsertPolicyChunk } from "@/lib/chat/policies";
 import { toPublicPolicyChunk } from "@/lib/chat/public";
 import type { PolicyChunk, UserRole } from "@/lib/chat/types";
@@ -10,6 +10,9 @@ function canAccessChunk(role: UserRole, chunk: PolicyChunk): boolean {
 }
 
 export async function GET(request: Request) {
+  if (!getRequester(request)) {
+    return NextResponse.json({ error: "Please sign in to view policies." }, { status: 401 });
+  }
   const role = resolveRoleFromRequest(request);
   const includeInactive = new URL(request.url).searchParams.get("includeInactive") === "true" && role === "hr_admin";
 

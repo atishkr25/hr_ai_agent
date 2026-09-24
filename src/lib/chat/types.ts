@@ -1,5 +1,33 @@
 export type UserRole = "employee" | "manager" | "hr_admin";
 
+/** The signed-in person, as carried in the session JWT. */
+export type SessionUser = {
+  id: string;
+  name: string;
+  email: string;
+  role: UserRole;
+};
+
+/** Contact details attached to conversations and HR tickets. */
+export type EmployeeContact = {
+  id: string;
+  name: string;
+  email: string;
+};
+
+export type EmployeeAccount = {
+  id: string;
+  name: string;
+  email: string;
+  role: "employee" | "manager";
+  passwordHash: string;
+  createdAt: string;
+  updatedAt: string;
+  lastLoginAt?: string;
+};
+
+export type PublicEmployee = Omit<EmployeeAccount, "passwordHash">;
+
 export type PolicyChunk = {
   id: string;
   documentId?: string;
@@ -48,6 +76,7 @@ export type ConversationTurn = {
 export type ConversationRecord = {
   id: string;
   role: UserRole;
+  employee?: EmployeeContact;
   title: string;
   messages: ConversationTurn[];
   createdAt: string;
@@ -61,6 +90,7 @@ export type HrTicket = {
   requestId: string;
   conversationId: string;
   role: UserRole;
+  employee?: EmployeeContact;
   question: string;
   answer: string;
   reason: string;

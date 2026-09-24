@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { writeAuditEvent } from "@/lib/chat/audit";
-import { resolveRoleFromRequest } from "@/lib/chat/role";
+import { getRequester, resolveRoleFromRequest } from "@/lib/chat/role";
 import { retrievePolicyMatchesHybrid } from "@/lib/chat/retrieval";
 import { toPublicPolicyChunk } from "@/lib/chat/public";
 
@@ -11,6 +11,9 @@ type ChatRequestBody = {
 };
 
 export async function POST(request: Request) {
+  if (!getRequester(request)) {
+    return NextResponse.json({ error: "Please sign in to use the HR assistant." }, { status: 401 });
+  }
   const role = resolveRoleFromRequest(request);
 
   let body: ChatRequestBody;

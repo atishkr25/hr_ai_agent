@@ -5,9 +5,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { AuditEvent } from "@/lib/chat/audit";
 import DocumentUpload from "@/components/admin/DocumentUpload";
 import { runEvaluation, type EvalResult } from "@/lib/evaluator";
-import type { ConversationRecord, HrTicket, PolicyChunk, UserRole } from "@/lib/chat/types";
+import type { ConversationRecord, EmployeeContact, HrTicket, PolicyChunk, PublicEmployee, UserRole } from "@/lib/chat/types";
 
-type TabKey = "knowledge" | "conversations" | "escalations" | "analytics" | "eval";
+type TabKey = "knowledge" | "conversations" | "escalations" | "employees" | "analytics" | "eval";
 
 type EvalStatus = "idle" | "running" | "pass" | "fail";
 
@@ -26,6 +26,29 @@ type TicketPayload = {
   count: number;
   tickets: HrTicket[];
 };
+
+type EmployeePayload = {
+  count: number;
+  employees: PublicEmployee[];
+};
+
+function EmployeeContactLine({ employee }: { employee?: EmployeeContact }) {
+  if (!employee) {
+    return <span className="text-[#8C8C95]">Unknown employee (asked before sign-in was required)</span>;
+  }
+  if (!employee.email) {
+    return <span>{employee.name}</span>;
+  }
+  return (
+    <span>
+      <span className="text-[#F5F5F5]">{employee.name}</span>
+      {" · "}
+      <a href={`mailto:${employee.email}`} className="text-[#A5B4FC] hover:underline">
+        {employee.email}
+      </a>
+    </span>
+  );
+}
 
 type ConversationPayload = {
   count: number;
@@ -67,6 +90,7 @@ const tabs: Array<{ key: TabKey; label: string }> = [
   { key: "conversations", label: "Conversations" },
   { key: "escalations", label: "Escalations" },
   { key: "analytics", label: "Analytics" },
+  { key: "employees", label: "Employees" },
   { key: "eval", label: "Eval Results" },
 ];
 
@@ -86,6 +110,7 @@ export default function AdminPage() {
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [tickets, setTickets] = useState<HrTicket[]>([]);
   const [conversations, setConversations] = useState<ConversationRecord[]>([]);
+  const [employees, setEmployees] = useState<PublicEmployee[]>([]);
   const [selectedConversation, setSelectedConversation] = useState<ConversationRecord | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [savingPolicy, setSavingPolicy] = useState(false);
@@ -110,20 +135,22 @@ export default function AdminPage() {
     setLoading(true);
     try {
       const headers = { "x-user-role": currentRole };
-      const [policyRes, auditRes, ticketRes, analyticsRes, conversationRes] = await Promise.all([
+      const [policyRes, auditRes, ticketRes, analyticsRes, conversationRes, employeeRes] = await Promise.all([
         fetch("/api/policies?includeInactive=true", { headers }),
         fetch("/api/audit?limit=200", { headers }),
         fetch("/api/tickets?limit=200", { headers }),
         fetch("/api/analytics", { headers }),
         fetch("/api/conversations?limit=200", { headers }),
+        fetch("/api/employees", { headers }),
       ]);
 
-      const [policyJson, auditJson, ticketJson, analyticsJson, conversationJson] = await Promise.all([
+      const [policyJson, auditJson, ticketJson, analyticsJson, conversationJson, employeeJson] = await Promise.all([
         readJson<PolicyPayload>(policyRes),
         readJson<AuditPayload>(auditRes),
         readJson<TicketPayload>(ticketRes),
         readJson<AnalyticsPayload>(analyticsRes),
         readJson<ConversationPayload>(conversationRes),
+        readJson<EmployeePayload>(employeeRes),
       ]);
 
       setPolicies(policyJson?.policies ?? []);
@@ -131,6 +158,7 @@ export default function AdminPage() {
       setTickets(ticketJson?.tickets ?? []);
       setAnalytics(analyticsJson);
       setConversations(conversationJson?.conversations ?? []);
+      setEmployees(employeeJson?.employees ?? []);
     } catch {
       // Keep the previously loaded data if a refresh fails.
     } finally {
@@ -247,6 +275,18 @@ export default function AdminPage() {
     setForm(policy ?? emptyForm);
     setFormError(null);
     setShowModal(true);
+  }
+
+  async function updateEmployeeRole(employee: PublicEmployee, role: PublicEmployee["role"]) {
+    const response = await fetch("/api/employees", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: employee.id, role }),
+    });
+    const payload = await readJson<{ employee?: PublicEmployee }>(response);
+    if (payload?.employee) {
+      setEmployees((prev) => prev.map((item) => (item.id === employee.id ? payload.employee as PublicEmployee : item)));
+    }
   }
 
   async function upsertPolicy() {
@@ -478,6 +518,7 @@ export default function AdminPage() {
               <table className="w-full text-left text-sm">
                 <thead className="bg-[#141415] text-[#8C8C95]">
                   <tr>
+                    <th className="px-3 py-2">Employee</th>
                     <th className="px-3 py-2">Role</th>
                     <th className="px-3 py-2">First Question</th>
                     <th className="px-3 py-2">Messages</th>
@@ -488,6 +529,7 @@ export default function AdminPage() {
                 <tbody>
                   {conversations.map((conversation) => (
                     <tr key={conversation.id} className="border-t border-[#1F1F21]">
+                      <td className="px-3 py-2 text-xs"><EmployeeContactLine employee={conversation.employee} /></td>
                       <td className="px-3 py-2">{conversation.role}</td>
                       <td className="px-3 py-2">{conversation.title}</td>
                       <td className="px-3 py-2">{conversation.messages.length}</td>
@@ -504,7 +546,7 @@ export default function AdminPage() {
                   ))}
                   {!conversations.length ? (
                     <tr>
-                      <td className="px-3 py-3 text-[#8C8C95]" colSpan={5}>
+                      <td className="px-3 py-3 text-[#8C8C95]" colSpan={6}>
                         No conversations recorded yet.
                       </td>
                     </tr>
@@ -527,6 +569,9 @@ export default function AdminPage() {
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
                         <p className="text-sm">{ticket.question}</p>
+                        <p className="mt-1 text-xs">
+                          <EmployeeContactLine employee={ticket.employee} />
+                        </p>
                         <p className="text-xs text-[#8C8C95]">
                           {ticket.role} · {new Date(ticket.createdAt).toLocaleString()} · {ticket.id}
                         </p>
@@ -634,6 +679,63 @@ export default function AdminPage() {
                   ))}
                 </div>
               </div>
+            </div>
+          </section>
+        ) : null}
+
+        {activeTab === "employees" ? (
+          <section>
+            <h2 className="mb-1 text-lg font-medium">Employees</h2>
+            <p className="mb-4 text-xs text-[#8C8C95]">
+              Registered employee accounts. Role changes apply the next time the employee signs in.
+            </p>
+            <div className="overflow-x-auto rounded-[8px] border border-[#1F1F21]">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-[#141415] text-[#8C8C95]">
+                  <tr>
+                    <th className="px-3 py-2">Name</th>
+                    <th className="px-3 py-2">Email</th>
+                    <th className="px-3 py-2">Role</th>
+                    <th className="px-3 py-2">Joined</th>
+                    <th className="px-3 py-2">Last sign-in</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {employees.map((employee) => (
+                    <tr key={employee.id} className="border-t border-[#1F1F21]">
+                      <td className="px-3 py-2">{employee.name}</td>
+                      <td className="px-3 py-2">
+                        <a href={`mailto:${employee.email}`} className="text-[#A5B4FC] hover:underline">
+                          {employee.email}
+                        </a>
+                      </td>
+                      <td className="px-3 py-2">
+                        <select
+                          value={employee.role}
+                          onChange={(event) =>
+                            void updateEmployeeRole(employee, event.target.value as PublicEmployee["role"])
+                          }
+                          className="rounded-[6px] border border-[#1F1F21] bg-[#0C0C0D] px-2 py-1 text-xs"
+                        >
+                          <option value="employee">employee</option>
+                          <option value="manager">manager</option>
+                        </select>
+                      </td>
+                      <td className="px-3 py-2 text-xs">{new Date(employee.createdAt).toLocaleDateString()}</td>
+                      <td className="px-3 py-2 text-xs">
+                        {employee.lastLoginAt ? new Date(employee.lastLoginAt).toLocaleString() : "-"}
+                      </td>
+                    </tr>
+                  ))}
+                  {!employees.length ? (
+                    <tr>
+                      <td className="px-3 py-3 text-[#8C8C95]" colSpan={5}>
+                        No employees have registered yet.
+                      </td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
             </div>
           </section>
         ) : null}
@@ -800,6 +902,9 @@ export default function AdminPage() {
             </button>
           </div>
 
+          <p className="mb-1 text-xs">
+            <EmployeeContactLine employee={selectedConversation.employee} />
+          </p>
           <p className="mb-3 text-xs text-[#8C8C95]">
             {selectedConversation.role} · started {new Date(selectedConversation.createdAt).toLocaleString()} · {selectedConversation.id}
           </p>

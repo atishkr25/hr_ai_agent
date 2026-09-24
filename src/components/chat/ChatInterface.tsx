@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   FormEvent,
@@ -21,6 +22,7 @@ type ChatMessage = {
   confidence?: number;
   escalated?: boolean;
   requestId?: string;
+  ticketId?: string;
 };
 
 type Conversation = {
@@ -39,12 +41,17 @@ type AnswerResponse = {
   citations: Citation[];
   escalated: boolean;
   confidence: number;
-  provider: "openai" | "azure-openai" | "local-fallback";
+  provider: "gemini" | "openai" | "azure-openai" | "local-fallback";
+  ticketId?: string;
 };
+
+function createConversationId(): string {
+  return `conv_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
 
 function createConversation(): Conversation {
   return {
-    id: `conv_${Date.now()}`,
+    id: createConversationId(),
     title: "New conversation",
     createdAt: new Date().toISOString(),
     messages: [],
@@ -82,13 +89,13 @@ function groupLabel(dateIso: string): "Today" | "Yesterday" | "This Week" | "Old
 }
 
 function confidenceBadge(confidence = 0, escalated = false) {
-  if (escalated || confidence < 0.6) {
+  if (escalated) {
     return {
       label: "Escalated to HR",
       className: "bg-[#2A1114] text-[#EF4444]",
     };
   }
-  if (confidence <= 0.8) {
+  if (confidence < 0.8) {
     return {
       label: "Review recommended",
       className: "bg-[#2A2110] text-[#F59E0B]",
@@ -100,16 +107,17 @@ function confidenceBadge(confidence = 0, escalated = false) {
   };
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 export default function ChatInterface() {
-  const [conversations, setConversations] = useState<Conversation[]>([
-    {
-      id: "conv_seed",
-      title: "Leave policy Q",
-      createdAt: new Date().toISOString(),
-      messages: [],
-    },
-  ]);
-  const [conversationId, setConversationId] = useState("conv_seed");
+  const router = useRouter();
+  // Each page load starts a fresh server-side conversation so earlier
+  // sessions' history is never fed back to the model as context.
+  const [initialConversation] = useState(createConversation);
+  const [conversations, setConversations] = useState<Conversation[]>([initialConversation]);
+  const [conversationId, setConversationId] = useState(initialConversation.id);
   const [role, setRole] = useState<UserRole>("employee");
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -172,15 +180,28 @@ export default function ChatInterface() {
 
   function updateConversationMessages(convId: string, updater: (messages: ChatMessage[]) => ChatMessage[]) {
     setConversations((prev) =>
-      prev.map((conv) =>
-        conv.id === convId
-          ? {
-              ...conv,
-              messages: updater(conv.messages),
-            }
-          : conv,
-      ),
+      prev.map((conv) => {
+        if (conv.id !== convId) {
+          return conv;
+        }
+
+        const messages = updater(conv.messages);
+        const firstQuestion = messages.find((message) => message.role === "user")?.content;
+        return {
+          ...conv,
+          title: conv.messages.length === 0 && firstQuestion ? firstQuestion.slice(0, 48) : conv.title,
+          messages,
+        };
+      }),
     );
+  }
+
+  async function logout() {
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+    } finally {
+      router.push("/");
+    }
   }
 
   function updateInputHeight() {
@@ -234,7 +255,7 @@ export default function ChatInterface() {
 
       const answerData = (await answerResponse.json()) as AnswerResponse | { error: string };
       if (!answerResponse.ok || "error" in answerData) {
-        throw new Error("Unable to generate policy answer.");
+        throw new Error("error" in answerData ? answerData.error : "Unable to generate policy answer.");
       }
 
       setStreamRequestId(answerData.requestId);
@@ -243,9 +264,13 @@ export default function ChatInterface() {
         setShowNoPolicyBanner(true);
       }
 
+      // Reveal the answer progressively; total animation time is capped so
+      // long answers do not keep the user waiting.
       const tokens = answerData.answer.split(/(\s+)/).filter(Boolean);
+      const delay = Math.min(18, 1200 / Math.max(tokens.length, 1));
       for (const token of tokens) {
         setStreamText((prev) => prev + token);
+        await sleep(delay);
       }
 
       const assistantMessage = createMessage("assistant", answerData.answer);
@@ -253,20 +278,18 @@ export default function ChatInterface() {
       assistantMessage.confidence = answerData.confidence;
       assistantMessage.escalated = answerData.escalated;
       assistantMessage.requestId = answerData.requestId;
+      assistantMessage.ticketId = answerData.ticketId;
       updateConversationMessages(conversationId, (messages) => [...messages, assistantMessage]);
       setStreamCitations(answerData.citations);
       setStreamConfidence(answerData.confidence);
       setStreamEscalated(answerData.escalated);
       setOpenCitationIds((prev) => ({ ...prev, [assistantMessage.id]: false }));
     } catch {
-      setModelError("OpenAI is temporarily unavailable. Please try again.");
+      setModelError("The HR assistant is temporarily unavailable. Please try again.");
       const fallback = createMessage(
         "assistant",
         "Something went wrong. Please try again in a moment.",
       );
-      fallback.escalated = false;
-      fallback.confidence = 0;
-      fallback.requestId = streamRequestId;
       updateConversationMessages(conversationId, (messages) => [...messages, fallback]);
     } finally {
       setIsStreaming(false);
@@ -335,7 +358,13 @@ export default function ChatInterface() {
           <span className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-[#1F1F21] text-xs">
             U
           </span>
-          <button className="text-xs text-[#8C8C95]">Logout</button>
+          <button
+            type="button"
+            onClick={() => void logout()}
+            className="mechanical text-xs text-[#8C8C95] hover:text-[#F5F5F5]"
+          >
+            Logout
+          </button>
         </div>
       </header>
 
@@ -452,7 +481,7 @@ export default function ChatInterface() {
                         </div>
                       ) : (
                         <div className="border-l-2 border-l-[#6366F1] pl-4">
-                          <p className="text-sm leading-7">{message.content}</p>
+                          <p className="whitespace-pre-wrap text-sm leading-7">{message.content}</p>
 
                           {typeof message.confidence === "number" ? (
                             <span className={`mt-3 inline-block rounded-[20px] px-2 py-[2px] text-[10px] ${badge.className}`}>
@@ -486,9 +515,11 @@ export default function ChatInterface() {
                                       <p className="text-xs text-[#8C8C95]">
                                         Section {citation.section} · Page {citation.page}
                                       </p>
-                                      <p className="mono mt-1 line-clamp-2 text-xs text-[#B7B7C0]">
-                                        Reference extracted from policy context.
-                                      </p>
+                                      {citation.source ? (
+                                        <p className="mono mt-1 line-clamp-2 text-xs text-[#B7B7C0]">
+                                          Source: {citation.source}
+                                        </p>
+                                      ) : null}
                                     </div>
                                   ))}
                                 </div>
@@ -499,6 +530,11 @@ export default function ChatInterface() {
                           {message.escalated ? (
                             <div className="mt-3 rounded-r-[6px] border-l-[3px] border-l-[#F59E0B] bg-[#1C1500] px-4 py-3 text-sm text-[#FCD34D]">
                               This query has been flagged for HR review. Your HR team will follow up.
+                              {message.ticketId ? (
+                                <span className="mono mt-1 block text-[10px] text-[#B8A15A]">
+                                  Ticket {message.ticketId}
+                                </span>
+                              ) : null}
                             </div>
                           ) : null}
                         </div>

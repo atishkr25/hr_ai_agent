@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { writeAuditEvent } from "@/lib/chat/audit";
 import { resolveRoleFromRequest } from "@/lib/chat/role";
-import { listPolicies, upsertPolicyChunk } from "@/lib/chat/policies";
+import { listPoliciesAsync, upsertPolicyChunk } from "@/lib/chat/policies";
+import { toPublicPolicyChunk } from "@/lib/chat/public";
 import type { PolicyChunk, UserRole } from "@/lib/chat/types";
 
 function canAccessChunk(role: UserRole, chunk: PolicyChunk): boolean {
@@ -10,13 +11,14 @@ function canAccessChunk(role: UserRole, chunk: PolicyChunk): boolean {
 
 export async function GET(request: Request) {
   const role = resolveRoleFromRequest(request);
+  const includeInactive = new URL(request.url).searchParams.get("includeInactive") === "true" && role === "hr_admin";
 
-  const visiblePolicies = listPolicies().filter((chunk) => canAccessChunk(role, chunk));
+  const visiblePolicies = (await listPoliciesAsync(includeInactive)).filter((chunk) => canAccessChunk(role, chunk));
 
   return NextResponse.json({
     role,
     count: visiblePolicies.length,
-    policies: visiblePolicies,
+    policies: visiblePolicies.map(toPublicPolicyChunk),
   });
 }
 
@@ -76,6 +78,6 @@ export async function POST(request: Request) {
 
   return NextResponse.json({
     status: "updated",
-    chunk: updated,
+    chunk: toPublicPolicyChunk(updated),
   });
 }

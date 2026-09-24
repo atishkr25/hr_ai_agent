@@ -22,6 +22,7 @@ interface IngestionHistoryEntry {
   chunkCount: number;
   upserted: number;
   status: "ready" | "partial" | "failed";
+  ocrUsed?: boolean;
   uploadedAt: string;
 }
 
@@ -30,13 +31,22 @@ type UploadToast = {
   message: string;
 };
 
-export default function DocumentUpload({ role }: { role: string }) {
+export default function DocumentUpload({
+  role,
+  onUploaded,
+}: {
+  role: string;
+  onUploaded?: () => void | Promise<void>;
+}) {
   const [drag, setDrag] = useState(false);
   const [upload, setUpload] = useState<UploadState>({ status: "idle", progress: 0 });
   const [docs, setDocs] = useState<IngestedDoc[]>([]);
   const [history, setHistory] = useState<IngestionHistoryEntry[]>([]);
   const [loadingDocs, setLoadingDocs] = useState(false);
   const [toast, setToast] = useState<UploadToast | null>(null);
+  const [policyKey, setPolicyKey] = useState("");
+  const [version, setVersion] = useState("");
+  const [visibility, setVisibility] = useState<string[]>(["employee", "manager", "hr_admin"]);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const loadDocs = useCallback(async () => {
@@ -136,6 +146,13 @@ export default function DocumentUpload({ role }: { role: string }) {
     try {
       const formData = new FormData();
       formData.append("file", file);
+      if (policyKey.trim()) {
+        formData.append("policyKey", policyKey.trim());
+      }
+      if (version.trim()) {
+        formData.append("version", version.trim());
+      }
+      formData.append("visibility", visibility.join(","));
 
       const res = await fetch("/api/ingest", {
         method: "POST",
@@ -177,6 +194,7 @@ export default function DocumentUpload({ role }: { role: string }) {
       });
 
       await loadDocs();
+      await onUploaded?.();
     } catch {
       clearTimeout(stageTimer1);
       clearTimeout(stageTimer2);
@@ -203,6 +221,8 @@ export default function DocumentUpload({ role }: { role: string }) {
 
   const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    // Reset so selecting the same file again still triggers an upload.
+    e.target.value = "";
     if (file) {
       void uploadFile(file);
     }
@@ -246,6 +266,51 @@ export default function DocumentUpload({ role }: { role: string }) {
           {toast.message}
         </div>
       ) : null}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 160px", gap: "8px", marginBottom: "10px" }}>
+        <input
+          value={policyKey}
+          onChange={(event) => setPolicyKey(event.target.value)}
+          placeholder="Policy key (e.g. annual-leave)"
+          className="rounded-[6px] border border-[#1F1F21] bg-[#141415] px-3 py-2 text-xs outline-none"
+        />
+        <input
+          value={version}
+          onChange={(event) => setVersion(event.target.value)}
+          placeholder="Version (e.g. 2026.1)"
+          className="rounded-[6px] border border-[#1F1F21] bg-[#141415] px-3 py-2 text-xs outline-none"
+        />
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "center",
+          gap: "12px",
+          marginBottom: "10px",
+          fontSize: "12px",
+          color: "#8C8C95",
+        }}
+      >
+        <span>Visible to:</span>
+        {(["employee", "manager", "hr_admin"] as const).map((item) => (
+          <label key={item} style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+            <input
+              type="checkbox"
+              checked={visibility.includes(item)}
+              disabled={item === "hr_admin"}
+              onChange={() =>
+                setVisibility((prev) =>
+                  prev.includes(item) ? prev.filter((role) => role !== item) : [...prev, item],
+                )
+              }
+            />
+            {item}
+          </label>
+        ))}
+        <span style={{ color: "#666" }}>Untick employee/manager for confidential documents.</span>
+      </div>
 
       <div
         onDragOver={(e) => {
@@ -540,7 +605,7 @@ export default function DocumentUpload({ role }: { role: string }) {
                     fontFamily: "Geist, sans-serif",
                   }}
                 >
-                  {entry.chunkCount} chunks ({entry.upserted} upserted) · {entry.fileType.toUpperCase()} · {new Date(entry.uploadedAt).toLocaleString()}
+                  {entry.chunkCount} chunks ({entry.upserted} upserted) · {entry.fileType.toUpperCase()}{entry.ocrUsed ? " · OCR" : ""} · {new Date(entry.uploadedAt).toLocaleString()}
                 </div>
               </div>
             ))}

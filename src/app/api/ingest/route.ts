@@ -1,99 +1,38 @@
 import { NextRequest, NextResponse } from "next/server";
-import pdfParse from "pdf-parse";
-import mammoth from "mammoth";
 import { v4 as uuidv4 } from "uuid";
 import { resolveRoleFromRequest } from "@/lib/chat/role";
+import { deactivatePolicyVersion, listPoliciesAsync, upsertPolicyChunks } from "@/lib/chat/policies";
+import { persistIngestionHistory, readIngestionHistory } from "@/lib/chat/store";
+import { chunkExtractedPages } from "@/lib/ingestion/chunk";
+import { extractDocxDocument, extractPdfDocument } from "@/lib/ingestion/extract";
+import type { UserRole } from "@/lib/chat/types";
 
 export const runtime = "nodejs";
 
-interface IngestChunk {
-  id: string;
-  title: string;
-  section: string;
-  page: number;
-  content: string;
-  visibleRoles: string[];
-}
+type UploadFileType = "pdf" | "docx";
 
 interface IngestionHistoryEntry {
   id: string;
   filename: string;
-  fileType: "pdf" | "docx";
+  fileType: UploadFileType;
   chunkCount: number;
   upserted: number;
   status: "ready" | "partial" | "failed";
+  ocrUsed: boolean;
   uploadedAt: string;
 }
 
 const INGESTION_HISTORY: IngestionHistoryEntry[] = [];
+let historyLoaded = false;
 
-function chunkText(text: string, filename: string): IngestChunk[] {
-  const chunks: IngestChunk[] = [];
-  const targetChunkChars = 1600;
-  const overlapChars = 200;
-
-  const paragraphs = text
-    .split(/\n{2,}/)
-    .map((item) => item.trim())
-    .filter((item) => item.length > 30);
-
-  let currentChunk = "";
-  let currentSection = "General";
-  let estimatedPage = 1;
-  let charCount = 0;
-
-  const headingRegex =
-    /^([A-Z][A-Z\s]{4,}|[\d]+[\.)]\s+[A-Z].{0,60}|[A-Z].{0,60}:)\s*$/;
-
-  for (let i = 0; i < paragraphs.length; i += 1) {
-    const paragraph = paragraphs[i];
-
-    if (headingRegex.test(paragraph) && paragraph.length < 80) {
-      if (currentChunk.trim().length > 100) {
-        chunks.push({
-          id: uuidv4(),
-          title: filename.replace(/\.[^/.]+$/, ""),
-          section: currentSection,
-          page: estimatedPage,
-          content: currentChunk.trim(),
-          visibleRoles: ["employee", "manager", "hr_admin"],
-        });
-      }
-      currentSection = paragraph.trim();
-      currentChunk = "";
-      continue;
-    }
-
-    currentChunk += `${currentChunk ? "\n\n" : ""}${paragraph}`;
-    charCount += paragraph.length;
-    estimatedPage = Math.max(1, Math.floor(charCount / 3000) + 1);
-
-    if (currentChunk.length >= targetChunkChars) {
-      chunks.push({
-        id: uuidv4(),
-        title: filename.replace(/\.[^/.]+$/, ""),
-        section: currentSection,
-        page: estimatedPage,
-        content: currentChunk.trim(),
-        visibleRoles: ["employee", "manager", "hr_admin"],
-      });
-
-      currentChunk = paragraph ? paragraph.slice(-overlapChars) : "";
-    }
+async function ensureHistoryLoaded(): Promise<void> {
+  if (historyLoaded) {
+    return;
   }
 
-  if (currentChunk.trim().length > 100) {
-    chunks.push({
-      id: uuidv4(),
-      title: filename.replace(/\.[^/.]+$/, ""),
-      section: currentSection,
-      page: estimatedPage,
-      content: currentChunk.trim(),
-      visibleRoles: ["employee", "manager", "hr_admin"],
-    });
-  }
-
-  return chunks;
+  historyLoaded = true;
+  const persisted = await readIngestionHistory<IngestionHistoryEntry>(100);
+  INGESTION_HISTORY.push(...persisted);
 }
 
 export async function POST(req: NextRequest) {
@@ -107,21 +46,20 @@ export async function POST(req: NextRequest) {
     }
 
     const formData = await req.formData();
-    const file = formData.get("file") as File | null;
-
-    if (!file) {
+    const file = formData.get("file");
+    if (!(file instanceof File)) {
       return NextResponse.json({ error: "No file provided." }, { status: 400 });
     }
 
     const filename = file.name;
     const lowerName = filename.toLowerCase();
-    const fileType = lowerName.endsWith(".pdf")
+    const fileType: UploadFileType | null = lowerName.endsWith(".pdf")
       ? "pdf"
       : lowerName.endsWith(".docx")
         ? "docx"
-        : "unsupported";
+        : null;
 
-    if (fileType === "unsupported") {
+    if (!fileType) {
       return NextResponse.json(
         { error: "Only PDF and DOCX files are supported." },
         { status: 400 },
@@ -131,109 +69,96 @@ export async function POST(req: NextRequest) {
     const maxSize = 20 * 1024 * 1024;
     if (file.size > maxSize) {
       return NextResponse.json(
-        { error: "File too large. Max 20MB." },
+        { error: "File too large. Maximum size is 20MB." },
         { status: 400 },
       );
     }
 
     const buffer = Buffer.from(await file.arrayBuffer());
+    const extracted = fileType === "pdf"
+      ? await extractPdfDocument(buffer)
+      : await extractDocxDocument(buffer);
+    const extractedTextLength = extracted.pages.reduce((sum, page) => sum + page.text.length, 0);
 
-    let rawText = "";
-    if (fileType === "pdf") {
-      const parsed = await pdfParse(buffer);
-      rawText = parsed.text;
-    }
-
-    if (fileType === "docx") {
-      const result = await mammoth.extractRawText({ buffer });
-      rawText = result.value;
-    }
-
-    if (!rawText || rawText.trim().length < 100) {
+    if (extractedTextLength < 100) {
       return NextResponse.json(
         {
-          error:
-            "Could not extract text from this file. It may be scanned or image-based.",
+          error: "Could not extract enough text. The file may be encrypted, empty, or an unsupported scanned document.",
+          ocrUsed: extracted.ocrUsed,
         },
         { status: 422 },
       );
     }
 
-    const chunks = chunkText(rawText, filename);
+    const documentId = uuidv4();
+    const policyKey = String(formData.get("policyKey") ?? "").trim() || undefined;
+    const version = String(formData.get("version") ?? "").trim() || undefined;
+    const requestedVisibility = String(formData.get("visibility") ?? "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item): item is UserRole => item === "employee" || item === "manager" || item === "hr_admin");
+    // HR admins must always be able to see and manage what they upload.
+    const visibility = requestedVisibility.length
+      ? Array.from(new Set<UserRole>([...requestedVisibility, "hr_admin"]))
+      : undefined;
+    const chunks = chunkExtractedPages(extracted.pages, filename, documentId, { policyKey, version, visibility });
     if (!chunks.length) {
       return NextResponse.json(
-        { error: "No usable content found in this document." },
+        { error: "No usable policy sections were found in this document." },
         { status: 422 },
       );
     }
 
-    const baseUrl = req.nextUrl.origin || process.env.VERCEL_URL 
-      ? `https://${process.env.VERCEL_URL}` 
-      : "http://localhost:3000";
-    let upserted = 0;
-    const errors: string[] = [];
-
-    for (const chunk of chunks) {
-      try {
-        const response = await fetch(`${baseUrl}/api/policies`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-user-role": "hr_admin",
-          },
-          body: JSON.stringify({
-            id: chunk.id,
-            title: chunk.title,
-            section: chunk.section,
-            page: String(chunk.page),
-            content: chunk.content,
-            source: filename,
-            visibility: chunk.visibleRoles,
-            visibleRoles: chunk.visibleRoles,
-          }),
-        });
-
-        if (response.ok) {
-          upserted += 1;
-        } else {
-          const errorData = await response.text();
-          errors.push(`Chunk ${chunk.id}: ${response.status} - ${errorData}`);
-        }
-      } catch (err) {
-        errors.push(`Chunk ${chunk.id}: ${err instanceof Error ? err.message : "Unknown error"}`);
-      }
+    const savedChunks = await upsertPolicyChunks(chunks);
+    const activePolicyKey = chunks[0]?.policyKey;
+    if (activePolicyKey) {
+      await deactivatePolicyVersion(activePolicyKey, documentId).catch((error) => {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        console.warn("[ingest] Could not deactivate older policy version:", errorMsg);
+      });
     }
-
-    const status: IngestionHistoryEntry["status"] =
-      upserted === 0 ? "failed" : upserted === chunks.length ? "ready" : "partial";
-
-    INGESTION_HISTORY.unshift({
-      id: uuidv4(),
+    const historyEntry: IngestionHistoryEntry = {
+      id: documentId,
       filename,
       fileType,
       chunkCount: chunks.length,
-      upserted,
-      status,
+      upserted: savedChunks.length,
+      status: savedChunks.length === chunks.length ? "ready" : "partial",
+      ocrUsed: extracted.ocrUsed,
       uploadedAt: new Date().toISOString(),
-    });
+    };
 
+    await ensureHistoryLoaded();
+    INGESTION_HISTORY.unshift(historyEntry);
     if (INGESTION_HISTORY.length > 100) {
       INGESTION_HISTORY.pop();
     }
+    await persistIngestionHistory(historyEntry).catch((error) => {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.warn("[ingest] Could not persist ingestion history:", errorMsg);
+    });
 
     return NextResponse.json({
       filename,
       fileType,
-      chunkCount: chunks.length,
-      upserted,
-      errors: errors.length ? errors : undefined,
-      status,
+      documentId,
+      policyKey: activePolicyKey,
+      version: chunks[0]?.version,
+      visibility: chunks[0]?.visibility,
+      chunkCount: savedChunks.length,
+      upserted: savedChunks.length,
+      status: historyEntry.status,
+      ocrUsed: extracted.ocrUsed,
     });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     console.error("[ingest] error:", errorMsg);
     return NextResponse.json(
-      { error: `Ingestion failed: ${errorMsg}` },
+      {
+        error: process.env.NODE_ENV === "development"
+          ? `Ingestion failed: ${errorMsg}`
+          : "Ingestion failed. Please verify the document and try again.",
+      },
       { status: 500 },
     );
   }
@@ -248,19 +173,11 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  const baseUrl = req.nextUrl.origin;
-  const response = await fetch(`${baseUrl}/api/policies`, {
-    headers: { "x-user-role": "hr_admin" },
-  });
-
-  const payload = (await response.json()) as
-    | { policies?: Array<{ title: string }> }
-    | Array<{ title: string }>;
-
-  const list = Array.isArray(payload) ? payload : payload.policies ?? [];
-
+  await ensureHistoryLoaded();
+  const policies = await listPoliciesAsync();
   const docs: Record<string, { title: string; chunkCount: number }> = {};
-  for (const policy of list) {
+
+  for (const policy of policies) {
     if (!docs[policy.title]) {
       docs[policy.title] = { title: policy.title, chunkCount: 0 };
     }

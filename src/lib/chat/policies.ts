@@ -1,5 +1,6 @@
 import type { PolicyChunk } from "./types";
-import { readStore, writeStore } from "./store";
+import { deactivatePolicyVersions as deactivatePolicyVersionsInStore, readStore, upsertPolicyDocument } from "./store";
+import { EMBEDDING_MODEL, embedTexts, hasCompatibleEmbedding, isEmbeddingConfigured } from "./embeddings";
 
 const SEED_CHUNKS: PolicyChunk[] = [
   {
@@ -96,51 +97,228 @@ const SEED_CHUNKS: PolicyChunk[] = [
 
 // Load from MongoDB, fall back to seed data
 let POLICY_CHUNKS: PolicyChunk[] = [...SEED_CHUNKS];
-let initialized = false;
+let loadedAt = 0;
+let loadPromise: Promise<void> | null = null;
+let embeddingBackfillPromise: Promise<void> | null = null;
+let embeddingBackfillRetryAt = 0;
 
-// Initialize policies from MongoDB on first request
-async function ensureInitialized(): Promise<void> {
-  if (initialized) return;
-  
-  try {
-    const chunks = await readStore<PolicyChunk>(SEED_CHUNKS);
-    POLICY_CHUNKS = chunks;
-    initialized = true;
-    console.log(`[policies] Initialized with ${POLICY_CHUNKS.length} chunks from MongoDB`);
-  } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    console.error("[policies] Failed to initialize from MongoDB:", errorMsg);
-    console.log("[policies] Using seed data as fallback");
-    POLICY_CHUNKS = [...SEED_CHUNKS];
-    initialized = true;
+// MongoDB is the source of truth. Route handlers can run in separate module
+// instances, so the in-memory cache is refreshed periodically to pick up
+// documents ingested or edited through another route.
+const REFRESH_INTERVAL_MS = 10_000;
+const EMBEDDING_BACKFILL_RETRY_MS = 60_000;
+
+async function ensureInitialized(forceRefresh = false): Promise<void> {
+  const stale = Date.now() - loadedAt > REFRESH_INTERVAL_MS;
+  if (loadedAt && !stale && !forceRefresh) {
+    return;
+  }
+
+  if (!loadPromise) {
+    loadPromise = (async () => {
+      try {
+        const chunks = await readStore<PolicyChunk>(SEED_CHUNKS);
+        if (!loadedAt) {
+          console.log(`[policies] Initialized with ${chunks.length} chunks`);
+        }
+        POLICY_CHUNKS = chunks;
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        console.error("[policies] Failed to load from MongoDB:", errorMsg);
+      } finally {
+        loadedAt = Date.now();
+        loadPromise = null;
+      }
+    })();
+  }
+
+  await loadPromise;
+}
+
+export function listPolicies(): PolicyChunk[] {
+  return POLICY_CHUNKS.filter((chunk) => chunk.isActive !== false);
+}
+
+function embeddingInput(chunk: PolicyChunk): string {
+  return `${chunk.title}\n${chunk.section}\n${chunk.content}`;
+}
+
+/**
+ * Generates embeddings for active chunks that have none, or whose stored vector
+ * came from a different model or dimensionality (for example, vectors created
+ * before GEMINI_EMBEDDING_DIMENSIONS was set). Mismatched vectors can never be
+ * compared with query vectors, so leaving them in place disables semantic search.
+ */
+async function backfillEmbeddings(): Promise<void> {
+  const stale = listPolicies().filter(
+    (chunk) => !hasCompatibleEmbedding(chunk.embedding, chunk.embeddingModel),
+  );
+  if (!stale.length) {
+    return;
+  }
+
+  const embeddings = await embedTexts(stale.map(embeddingInput));
+  let updatedCount = 0;
+
+  for (let index = 0; index < stale.length; index += 1) {
+    const chunk = stale[index];
+    const embedding = embeddings[index];
+    if (!embedding) {
+      continue;
+    }
+
+    const updated = {
+      ...chunk,
+      embedding,
+      embeddingModel: EMBEDDING_MODEL,
+      updatedAt: new Date().toISOString(),
+    };
+    const position = POLICY_CHUNKS.findIndex((item) => item.id === chunk.id);
+    if (position >= 0) {
+      POLICY_CHUNKS[position] = updated;
+    }
+    updatedCount += 1;
+
+    try {
+      await upsertPolicyDocument(updated);
+    } catch (error) {
+      console.warn("[policies] Could not persist generated embedding:", error);
+    }
+  }
+
+  console.log(`[policies] Embedded ${updatedCount}/${stale.length} chunks with ${EMBEDDING_MODEL}`);
+  if (updatedCount < stale.length) {
+    embeddingBackfillRetryAt = Date.now() + EMBEDDING_BACKFILL_RETRY_MS;
   }
 }
 
-// Initialize on module load (non-blocking)
-ensureInitialized().catch((err) => {
-  console.error("[policies] Initialization error:", err);
-});
+async function ensureEmbeddings(): Promise<void> {
+  if (!isEmbeddingConfigured() || Date.now() < embeddingBackfillRetryAt) {
+    return;
+  }
 
-export function listPolicies(): PolicyChunk[] {
-  return POLICY_CHUNKS;
+  if (!embeddingBackfillPromise) {
+    embeddingBackfillPromise = backfillEmbeddings()
+      .catch((error) => {
+        embeddingBackfillRetryAt = Date.now() + EMBEDDING_BACKFILL_RETRY_MS;
+        console.warn("[policies] Embedding backfill skipped:", error);
+      })
+      .finally(() => {
+        embeddingBackfillPromise = null;
+      });
+  }
+
+  await embeddingBackfillPromise;
+}
+
+export async function listPoliciesAsync(includeInactive = false): Promise<PolicyChunk[]> {
+  await ensureInitialized();
+  await ensureEmbeddings();
+  return includeInactive ? POLICY_CHUNKS : listPolicies();
 }
 
 export async function upsertPolicyChunk(chunk: PolicyChunk): Promise<PolicyChunk> {
-  // Ensure initialized before upserting
   await ensureInitialized();
-  
+
+  let preparedChunk = {
+    ...chunk,
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (!hasCompatibleEmbedding(preparedChunk.embedding, preparedChunk.embeddingModel) && isEmbeddingConfigured()) {
+    try {
+      const [embedding] = await embedTexts([embeddingInput(preparedChunk)]);
+      if (embedding) {
+        preparedChunk = {
+          ...preparedChunk,
+          embedding,
+          embeddingModel: EMBEDDING_MODEL,
+        };
+      }
+    } catch (error) {
+      console.warn("[policies] Could not generate chunk embedding:", error);
+    }
+  }
+
   const existingIndex = POLICY_CHUNKS.findIndex((item) => item.id === chunk.id);
 
   if (existingIndex >= 0) {
-    POLICY_CHUNKS[existingIndex] = chunk;
+    POLICY_CHUNKS[existingIndex] = preparedChunk;
   } else {
-    POLICY_CHUNKS.push(chunk);
+    POLICY_CHUNKS.push(preparedChunk);
   }
 
-  // Persist to MongoDB (non-blocking)
-  writeStore(POLICY_CHUNKS).catch((err) => {
-    console.error("[policies] Failed to persist to MongoDB:", err);
-  });
+  try {
+    await upsertPolicyDocument(preparedChunk);
+  } catch (error) {
+    console.error("[policies] Failed to persist policy chunk:", error);
+  }
 
-  return POLICY_CHUNKS[existingIndex >= 0 ? existingIndex : POLICY_CHUNKS.length - 1];
+  return preparedChunk;
+}
+
+export async function upsertPolicyChunks(chunks: PolicyChunk[]): Promise<PolicyChunk[]> {
+  await ensureInitialized();
+  if (!chunks.length) {
+    return [];
+  }
+
+  const preparedChunks = chunks.map((chunk) => ({
+    ...chunk,
+    updatedAt: new Date().toISOString(),
+  }));
+
+  if (isEmbeddingConfigured()) {
+    try {
+      const embeddings = await embedTexts(preparedChunks.map(embeddingInput));
+      for (let index = 0; index < preparedChunks.length; index += 1) {
+        const embedding = embeddings[index];
+        if (embedding) {
+          preparedChunks[index] = {
+            ...preparedChunks[index],
+            embedding,
+            embeddingModel: EMBEDDING_MODEL,
+          };
+        }
+      }
+    } catch (error) {
+      console.warn("[policies] Could not generate document embeddings:", error);
+    }
+  }
+
+  for (const chunk of preparedChunks) {
+    const existingIndex = POLICY_CHUNKS.findIndex((item) => item.id === chunk.id);
+    if (existingIndex >= 0) {
+      POLICY_CHUNKS[existingIndex] = chunk;
+    } else {
+      POLICY_CHUNKS.push(chunk);
+    }
+
+    try {
+      await upsertPolicyDocument(chunk);
+    } catch (error) {
+      console.error("[policies] Failed to persist policy chunk:", error);
+    }
+  }
+
+  return preparedChunks;
+}
+
+export async function deactivatePolicyVersion(
+  policyKey: string,
+  activeDocumentId: string,
+): Promise<void> {
+  await ensureInitialized();
+  POLICY_CHUNKS = POLICY_CHUNKS.map((chunk) =>
+    chunk.policyKey === policyKey && chunk.documentId !== activeDocumentId
+      ? { ...chunk, isActive: false, updatedAt: new Date().toISOString() }
+      : chunk,
+  );
+
+  try {
+    await deactivatePolicyVersionsInStore(policyKey, activeDocumentId);
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.warn("[policies] Could not persist inactive policy version:", errorMsg);
+  }
 }

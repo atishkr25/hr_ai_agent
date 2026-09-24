@@ -1,4 +1,4 @@
-import { runPolicyQa } from "./engine";
+import { answerPolicyQuestion } from "./answer";
 import { isInclusiveTone } from "./tone";
 import type { UserRole } from "./types";
 
@@ -34,18 +34,19 @@ const EVAL_CASES: EvalCase[] = [
   },
 ];
 
-export function evaluateAgent() {
-  const runs = EVAL_CASES.map((item) => {
-    const result = runPolicyQa(item.question, item.role);
+export async function evaluateAgent() {
+  const runs = [];
+  for (const item of EVAL_CASES) {
+    const result = await answerPolicyQuestion(item.question, item.role);
 
     const citationPass = item.expectCitation
       ? result.citations.length > 0
       : result.citations.length === 0;
 
-    const escalationPass = result.escalate === item.expectEscalation;
+    const escalationPass = result.escalated === item.expectEscalation;
     const tonePass = isInclusiveTone(result.answer);
 
-    return {
+    runs.push({
       id: item.id,
       role: item.role,
       question: item.question,
@@ -54,8 +55,8 @@ export function evaluateAgent() {
       escalationPass,
       tonePass,
       passed: citationPass && escalationPass && tonePass,
-    };
-  });
+    });
+  }
 
   const total = runs.length;
   const passed = runs.filter((run) => run.passed).length;

@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { writeAuditEvent } from "@/lib/chat/audit";
 import { resolveRoleFromRequest } from "@/lib/chat/role";
-import { retrievePolicyMatches } from "@/lib/chat/retrieval";
+import { retrievePolicyMatchesHybrid } from "@/lib/chat/retrieval";
+import { toPublicPolicyChunk } from "@/lib/chat/public";
 
 type ChatRequestBody = {
   query?: string;
@@ -30,7 +31,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const matches = retrievePolicyMatches(query, role, 5);
+  const matches = await retrievePolicyMatchesHybrid(query, role, 5);
   const chunks = matches.map((item) => item.chunk);
   const requestId = `req_${Date.now()}`;
 
@@ -49,6 +50,6 @@ export async function POST(request: Request) {
     requestId,
     role,
     query,
-    chunks,
+    chunks: chunks.map(toPublicPolicyChunk),
   });
 }

@@ -45,3 +45,6 @@ yarn-error.log*
 next-env.d.ts
 
 *.md
+
+# tesseract.js OCR language data downloaded at runtime
+*.traineddata

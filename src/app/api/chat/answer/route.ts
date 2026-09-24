@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
 import { writeAuditEvent } from "@/lib/chat/audit";
-import { generatePolicyAnswer } from "@/lib/chat/llm";
-import { resolveRoleFromRequest } from "@/lib/chat/role";
-import { retrievePolicyMatches } from "@/lib/chat/retrieval";
-import type { UserRole } from "@/lib/chat/types";
+import { answerPolicyQuestion } from "@/lib/chat/answer";
+import { getSessionRoleFromHeaders, resolveRoleFromRequest } from "@/lib/chat/role";
+import { toPublicPolicyChunk } from "@/lib/chat/public";
+import { readConversation, upsertConversation, upsertHrTicket } from "@/lib/chat/store";
+import { notifyHrTicket } from "@/lib/notifications";
+import type { ConversationRecord, ConversationTurn, HrTicket, UserRole } from "@/lib/chat/types";
 
 type AnswerRequestBody = {
   query?: string;
@@ -11,113 +13,15 @@ type AnswerRequestBody = {
   conversationId?: string;
 };
 
-function confidenceFromChunks(chunkCount: number, escalated: boolean) {
-  if (escalated) {
-    return 0.3;
-  }
-
-  return Math.min(0.95, 0.6 + chunkCount * 0.07);
-}
-
-const STOP_WORDS = new Set([
-  "the",
-  "a",
-  "an",
-  "is",
-  "are",
-  "to",
-  "for",
-  "of",
-  "and",
-  "or",
-  "in",
-  "on",
-  "with",
-  "can",
-  "be",
-  "does",
-  "do",
-  "how",
-  "what",
-  "when",
-  "where",
-  "show",
-  "policy",
-  "company",
-]);
-
-function tokenize(text: string) {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .map((token) => token.trim())
-    .filter((token) => token.length > 2 && !STOP_WORDS.has(token));
-}
-
-function shouldEscalateBeforeLlm(
-  query: string,
-  topScore: number,
-  chunks: Array<{ title: string; section: string; content: string }>,
-) {
-  const normalizedQuery = query.toLowerCase();
-  const sensitiveTerms = [
-    "executive",
-    "compensation",
-    "salary",
-    "disciplinary",
-    "confidential",
-    "bonus",
-  ];
-
-  const mentionsSensitiveTerm = sensitiveTerms.some((term) =>
-    normalizedQuery.includes(term),
-  );
-
-  const contextContainsSensitive = chunks.some((chunk) => {
-    const haystack = `${chunk.title} ${chunk.section} ${chunk.content}`.toLowerCase();
-    return sensitiveTerms.some((term) => haystack.includes(term));
-  });
-
-  if (topScore < 0.22) {
-    return true;
-  }
-
-  const queryTokens = new Set(tokenize(query));
-  const contextTokens = new Set(tokenize(chunks.map((chunk) => `${chunk.title} ${chunk.section} ${chunk.content}`).join(" ")));
-  const covered = Array.from(queryTokens).filter((token) => contextTokens.has(token));
-  const coverage = queryTokens.size ? covered.length / queryTokens.size : 1;
-
-  // A single generic overlap should not make an unrelated question look reliable.
-  if (coverage < 0.5 || (coverage < 0.7 && topScore < 0.5)) {
-    return true;
-  }
-
-  if (mentionsSensitiveTerm && !contextContainsSensitive) {
-    return true;
-  }
-
-  return false;
-}
-
-function enforceCitations(answer: string, citations: Array<{ title: string; section: string; page: string }>): string {
-  if (!citations.length) {
-    return answer;
-  }
-
-  const hasInlineCitation = answer.includes("[Policy:");
-  if (hasInlineCitation) {
-    return answer;
-  }
-
-  const first = citations[0];
-  return `${answer}\n\n[Policy: ${first.title}, Section: ${first.section}, Page: ${first.page}]`;
-}
-
 export async function POST(request: Request) {
   const role: UserRole = resolveRoleFromRequest(request, {
     allowAdminRoleOverride: true,
   });
+  // Evaluation runs from the admin dashboard exercise the real pipeline but
+  // must not open HR tickets or skew analytics. Only honoured for HR admins.
+  const isEvaluation =
+    request.headers.get("x-eval-run") === "true" &&
+    getSessionRoleFromHeaders(request.headers) === "hr_admin";
 
   let body: AnswerRequestBody;
   try {
@@ -131,10 +35,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Query is required." }, { status: 400 });
   }
 
-  const matches = retrievePolicyMatches(query, role, 5);
-  const chunks = matches.map((item) => item.chunk);
-  const topScore = matches[0]?.score ?? 0;
-  const requestId = `req_${Date.now()}`;
+  const conversationId = body.conversationId?.trim() || `conv_${Date.now()}`;
+  const existingConversation = await readConversation(conversationId);
+  const history = existingConversation?.messages ?? [];
+  const requestId = `req_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  const response = await answerPolicyQuestion(query, role, history);
+  const { answer, confidence } = response;
+  const chunks = response.matches.map((item) => item.chunk);
 
   writeAuditEvent({
     type: "qa_query",
@@ -143,27 +50,62 @@ export async function POST(request: Request) {
     metadata: {
       chunks: chunks.length,
       requestId,
-      conversationId: body.conversationId ?? "default",
+      conversationId,
+      escalated: response.escalated,
+      provider: response.provider,
+      // Attribute the query to the policy actually cited in the answer.
+      topPolicy: response.citations[0]?.title ?? "none",
+      ...(isEvaluation ? { evaluation: true } : {}),
     },
   });
 
-  const forceEscalation = shouldEscalateBeforeLlm(query, topScore, chunks);
+  const now = new Date().toISOString();
+  const userTurn: ConversationTurn = {
+    id: `${requestId}_user`,
+    role: "user",
+    content: query,
+    createdAt: now,
+  };
+  const assistantTurn: ConversationTurn = {
+    id: `${requestId}_assistant`,
+    role: "assistant",
+    content: answer,
+    createdAt: now,
+    citations: response.citations,
+    escalated: response.escalated,
+    requestId,
+  };
+  const conversation: ConversationRecord = {
+    id: conversationId,
+    role,
+    title: existingConversation?.title || query.slice(0, 72),
+    messages: [...history, userTurn, assistantTurn].slice(-40),
+    createdAt: existingConversation?.createdAt || now,
+    updatedAt: now,
+  };
+  if (!isEvaluation) {
+    await upsertConversation(conversation);
+  }
 
-  const response = forceEscalation
-    ? {
-        answer:
-          "I don't have enough policy information to answer this confidently. Escalating to your HR team.",
-        citations: [],
-        escalated: true,
-        escalationReason:
-          "Low-confidence retrieval or sensitive query without matching policy context.",
-        provider: "local-fallback" as const,
-      }
-    : await generatePolicyAnswer(query, role, chunks);
-  const answer = enforceCitations(response.answer, response.citations);
-  const confidence = confidenceFromChunks(chunks.length, response.escalated);
+  if (response.escalated && !isEvaluation) {
+    const ticket: HrTicket = {
+      id: `ticket_${requestId}`,
+      requestId,
+      conversationId,
+      role,
+      question: query,
+      answer,
+      reason: response.escalationReason ?? "Low confidence or insufficient policy context.",
+      status: "open",
+      notificationStatus: "pending",
+      createdAt: now,
+      updatedAt: now,
+    };
+    await upsertHrTicket(ticket);
+    void notifyHrTicket(ticket).then(async (notificationStatus) => {
+      await upsertHrTicket({ ...ticket, notificationStatus, updatedAt: new Date().toISOString() });
+    });
 
-  if (response.escalated) {
     writeAuditEvent({
       type: "qa_escalation",
       role,
@@ -172,6 +114,8 @@ export async function POST(request: Request) {
       metadata: {
         requestId,
         provider: response.provider,
+        ticketId: ticket.id,
+        ...(isEvaluation ? { evaluation: true } : {}),
       },
     });
   }
@@ -180,12 +124,14 @@ export async function POST(request: Request) {
     requestId,
     role,
     query,
-    chunks,
+    conversationId,
+    chunks: chunks.map(toPublicPolicyChunk),
     answer,
     citations: response.citations,
     escalated: response.escalated,
     escalationReason: response.escalationReason,
     confidence,
     provider: response.provider,
+    ticketId: response.escalated && !isEvaluation ? `ticket_${requestId}` : undefined,
   });
 }

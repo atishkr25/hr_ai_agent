@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import type { UserRole } from "./types";
 
 export const SESSION_COOKIE_NAME = "hr_agent_session";
+export const SESSION_MAX_AGE_SECONDS = 60 * 60 * 12;
 
 function base64UrlEncode(value: string): string {
   return Buffer.from(value, "utf8").toString("base64url");
@@ -72,7 +73,11 @@ export function verifySessionToken(token: string | undefined): UserRole | null {
   }
 
   try {
-    const parsed = JSON.parse(base64UrlDecode(encodedPayload)) as { role?: string };
+    const parsed = JSON.parse(base64UrlDecode(encodedPayload)) as { role?: string; iat?: number };
+    // The cookie max-age is only a browser hint; enforce expiry server-side too.
+    if (typeof parsed.iat !== "number" || Date.now() - parsed.iat > SESSION_MAX_AGE_SECONDS * 1000) {
+      return null;
+    }
     return resolveRole(parsed.role ?? null);
   } catch {
     return null;

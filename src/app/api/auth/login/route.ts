@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createSessionToken, SESSION_COOKIE_NAME } from "@/lib/chat/role";
+import { createSessionToken, SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS } from "@/lib/chat/role";
 
 type LoginBody = {
   password?: string;
@@ -36,7 +36,7 @@ export async function POST(request: Request) {
     sameSite: "lax",
     secure: process.env.NODE_ENV === "production",
     path: "/",
-    maxAge: 60 * 60 * 12,
+    maxAge: SESSION_MAX_AGE_SECONDS,
   });
 
   return response;

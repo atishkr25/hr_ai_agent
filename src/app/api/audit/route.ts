@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { listAuditEvents } from "@/lib/chat/audit";
+import { listAuditEventsAsync } from "@/lib/chat/audit";
 import { resolveRoleFromRequest } from "@/lib/chat/role";
 
 export async function GET(request: Request) {
@@ -13,7 +13,7 @@ export async function GET(request: Request) {
 
   const url = new URL(request.url);
   const limitParam = Number(url.searchParams.get("limit") ?? "50");
-  const events = listAuditEvents(limitParam);
+  const events = await listAuditEventsAsync(limitParam);
 
   return NextResponse.json({
     count: events.length,

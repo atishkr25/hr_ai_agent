@@ -11,6 +11,6 @@ export async function GET(request: Request) {
     );
   }
 
-  const result = evaluateAgent();
+  const result = await evaluateAgent();
   return NextResponse.json(result);
 }

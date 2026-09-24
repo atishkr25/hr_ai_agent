@@ -5,9 +5,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { AuditEvent } from "@/lib/chat/audit";
 import DocumentUpload from "@/components/admin/DocumentUpload";
 import { runEvaluation, type EvalResult } from "@/lib/evaluator";
-import type { PolicyChunk, UserRole } from "@/lib/chat/types";
+import type { ConversationRecord, HrTicket, PolicyChunk, UserRole } from "@/lib/chat/types";
 
-type TabKey = "knowledge" | "conversations" | "escalations" | "eval";
+type TabKey = "knowledge" | "conversations" | "escalations" | "analytics" | "eval";
 
 type EvalStatus = "idle" | "running" | "pass" | "fail";
 
@@ -22,10 +22,51 @@ type AuditPayload = {
   events: AuditEvent[];
 };
 
+type TicketPayload = {
+  count: number;
+  tickets: HrTicket[];
+};
+
+type ConversationPayload = {
+  count: number;
+  conversations: ConversationRecord[];
+};
+
+const emptyForm: PolicyChunk = {
+  id: "",
+  title: "",
+  section: "",
+  page: "",
+  source: "",
+  content: "",
+  visibility: ["employee", "manager", "hr_admin"],
+};
+
+async function readJson<T>(response: Response): Promise<T | null> {
+  if (!response.ok) {
+    return null;
+  }
+  try {
+    return (await response.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+type AnalyticsPayload = {
+  totalQueries: number;
+  totalEscalations: number;
+  escalationRate: number;
+  byRole: Record<string, number>;
+  topQuestions: Array<{ question: string; count: number }>;
+  topPolicies: Array<{ policy: string; count: number }>;
+};
+
 const tabs: Array<{ key: TabKey; label: string }> = [
   { key: "knowledge", label: "Knowledge Base" },
   { key: "conversations", label: "Conversations" },
   { key: "escalations", label: "Escalations" },
+  { key: "analytics", label: "Analytics" },
   { key: "eval", label: "Eval Results" },
 ];
 
@@ -43,12 +84,16 @@ export default function AdminPage() {
   const [activeTab, setActiveTab] = useState<TabKey>("knowledge");
   const [policies, setPolicies] = useState<PolicyChunk[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [tickets, setTickets] = useState<HrTicket[]>([]);
+  const [conversations, setConversations] = useState<ConversationRecord[]>([]);
+  const [selectedConversation, setSelectedConversation] = useState<ConversationRecord | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [savingPolicy, setSavingPolicy] = useState(false);
+  const [analytics, setAnalytics] = useState<AnalyticsPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [showModal, setShowModal] = useState(false);
-  const [selectedAudit, setSelectedAudit] = useState<AuditEvent | null>(null);
   const [expandedEscalation, setExpandedEscalation] = useState<string | null>(null);
-  const [escalationStatus, setEscalationStatus] = useState<Record<string, "Pending" | "Resolved">>({});
   const [hrResponse, setHrResponse] = useState<Record<string, string>>({});
   const [evalResults, setEvalResults] = useState<EvalResult[]>([]);
   const [evalState, setEvalState] = useState<Record<string, EvalStatus>>({});
@@ -59,29 +104,35 @@ export default function AdminPage() {
   const [loginPassword, setLoginPassword] = useState("");
   const [loggingIn, setLoggingIn] = useState(false);
 
-  const [form, setForm] = useState<PolicyChunk>({
-    id: "",
-    title: "",
-    section: "",
-    page: "",
-    source: "",
-    content: "",
-    visibility: ["employee"],
-  });
+  const [form, setForm] = useState<PolicyChunk>(emptyForm);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-      const [policyRes, auditRes] = await Promise.all([
-        fetch("/api/policies", { headers: { "x-user-role": currentRole } }),
-        fetch("/api/audit?limit=200", { headers: { "x-user-role": currentRole } }),
+      const headers = { "x-user-role": currentRole };
+      const [policyRes, auditRes, ticketRes, analyticsRes, conversationRes] = await Promise.all([
+        fetch("/api/policies?includeInactive=true", { headers }),
+        fetch("/api/audit?limit=200", { headers }),
+        fetch("/api/tickets?limit=200", { headers }),
+        fetch("/api/analytics", { headers }),
+        fetch("/api/conversations?limit=200", { headers }),
       ]);
 
-      const policyJson = (await policyRes.json()) as PolicyPayload;
-      const auditJson = (await auditRes.json()) as AuditPayload;
+      const [policyJson, auditJson, ticketJson, analyticsJson, conversationJson] = await Promise.all([
+        readJson<PolicyPayload>(policyRes),
+        readJson<AuditPayload>(auditRes),
+        readJson<TicketPayload>(ticketRes),
+        readJson<AnalyticsPayload>(analyticsRes),
+        readJson<ConversationPayload>(conversationRes),
+      ]);
 
-      setPolicies(policyJson.policies ?? []);
-      setAuditEvents(auditJson.events ?? []);
+      setPolicies(policyJson?.policies ?? []);
+      setAuditEvents(auditJson?.events ?? []);
+      setTickets(ticketJson?.tickets ?? []);
+      setAnalytics(analyticsJson);
+      setConversations(conversationJson?.conversations ?? []);
+    } catch {
+      // Keep the previously loaded data if a refresh fails.
     } finally {
       setLoading(false);
     }
@@ -156,6 +207,9 @@ export default function AdminPage() {
     setAuthError(null);
     setEvalResults([]);
     setEvalState({});
+    setTickets([]);
+    setAnalytics(null);
+    setConversations([]);
   }
 
   const filteredPolicies = useMemo(() => {
@@ -169,31 +223,71 @@ export default function AdminPage() {
     });
   }, [policies, search]);
 
-  const queryEvents = auditEvents.filter((event) => event.type === "qa_query");
   const escalationEvents = auditEvents.filter((event) => event.type === "qa_escalation");
 
-  async function upsertPolicy() {
-    const id = form.id || `${form.title.toLowerCase().replace(/\s+/g, "-")}-${Date.now()}`;
-    await fetch("/api/policies", {
-      method: "POST",
+  async function updateTicket(ticket: HrTicket, status: HrTicket["status"], hrResponse?: string) {
+    const response = await fetch("/api/tickets", {
+      method: "PATCH",
       headers: {
         "Content-Type": "application/json",
         "x-user-role": currentRole,
       },
-      body: JSON.stringify({ ...form, id }),
+      body: JSON.stringify({ id: ticket.id, status, hrResponse }),
     });
+    if (!response.ok) {
+      return;
+    }
+    const payload = (await response.json()) as { ticket?: HrTicket };
+    if (payload.ticket) {
+      setTickets((prev) => prev.map((item) => item.id === ticket.id ? payload.ticket as HrTicket : item));
+    }
+  }
 
-    setShowModal(false);
-    setForm({
-      id: "",
-      title: "",
-      section: "",
-      page: "",
-      source: "",
-      content: "",
-      visibility: ["employee"],
-    });
-    await fetchData();
+  function openPolicyModal(policy?: PolicyChunk) {
+    setForm(policy ?? emptyForm);
+    setFormError(null);
+    setShowModal(true);
+  }
+
+  async function upsertPolicy() {
+    const missing = (["title", "section", "page", "source", "content"] as const).filter(
+      (field) => !String(form[field] ?? "").trim(),
+    );
+    if (missing.length) {
+      setFormError(`Please fill in: ${missing.join(", ")}.`);
+      return;
+    }
+    if (!form.visibility.length) {
+      setFormError("Select at least one role that can see this chunk.");
+      return;
+    }
+
+    const id = form.id || `${form.title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${Date.now()}`;
+    setSavingPolicy(true);
+    setFormError(null);
+    try {
+      const response = await fetch("/api/policies", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-user-role": currentRole,
+        },
+        body: JSON.stringify({ ...form, id }),
+      });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => ({}))) as { error?: string };
+        setFormError(payload.error ?? "Could not save policy chunk.");
+        return;
+      }
+
+      setShowModal(false);
+      setForm(emptyForm);
+      await fetchData();
+    } catch {
+      setFormError("Network error. Please try again.");
+    } finally {
+      setSavingPolicy(false);
+    }
   }
 
   function toggleVisibility(role: UserRole) {
@@ -304,7 +398,7 @@ export default function AdminPage() {
       <motion.section initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.15 }}>
         {activeTab === "knowledge" ? (
           <section>
-            <DocumentUpload role={currentRole} />
+            <DocumentUpload role={currentRole} onUploaded={fetchData} />
 
             {currentRole !== "hr_admin" ? (
               <div className="mb-4 rounded-[6px] border-l-[3px] border-l-[#F59E0B] bg-[#1C1500] px-3 py-2 text-xs text-[#FCD34D]">
@@ -316,7 +410,7 @@ export default function AdminPage() {
               <h2 className="text-lg font-medium">Policy Knowledge Base</h2>
               {currentRole === "hr_admin" ? (
                 <button
-                  onClick={() => setShowModal(true)}
+                  onClick={() => openPolicyModal()}
                   className="mechanical rounded-[6px] border border-[#1F1F21] px-3 py-2 text-sm hover:bg-[#1A1A1C]"
                 >
                   Add Policy Chunk
@@ -339,6 +433,8 @@ export default function AdminPage() {
                       <p className="text-sm font-medium">{policy.title}</p>
                       <p className="text-xs text-[#8C8C95]">
                         Section {policy.section} · Page {policy.page}
+                        {policy.version ? ` · v${policy.version}` : ""}
+                        {policy.isActive === false ? " · Archived" : ""}
                       </p>
                     </div>
                     <div className="flex flex-wrap gap-1">
@@ -362,10 +458,7 @@ export default function AdminPage() {
                   {currentRole === "hr_admin" ? (
                     <div className="mt-3 flex justify-end">
                       <button
-                        onClick={() => {
-                          setForm(policy);
-                          setShowModal(true);
-                        }}
+                        onClick={() => openPolicyModal(policy)}
                         className="mechanical rounded-[6px] border border-[#1F1F21] px-3 py-1 text-xs hover:bg-[#1A1A1C]"
                       >
                         Edit
@@ -385,23 +478,23 @@ export default function AdminPage() {
               <table className="w-full text-left text-sm">
                 <thead className="bg-[#141415] text-[#8C8C95]">
                   <tr>
-                    <th className="px-3 py-2">Employee</th>
+                    <th className="px-3 py-2">Role</th>
                     <th className="px-3 py-2">First Question</th>
                     <th className="px-3 py-2">Messages</th>
-                    <th className="px-3 py-2">Date</th>
+                    <th className="px-3 py-2">Last Activity</th>
                     <th className="px-3 py-2">View</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {queryEvents.map((event) => (
-                    <tr key={event.id} className="border-t border-[#1F1F21]">
-                      <td className="px-3 py-2">{event.role}</td>
-                      <td className="px-3 py-2">{event.question}</td>
-                      <td className="px-3 py-2">2</td>
-                      <td className="px-3 py-2">{new Date(event.createdAt).toLocaleString()}</td>
+                  {conversations.map((conversation) => (
+                    <tr key={conversation.id} className="border-t border-[#1F1F21]">
+                      <td className="px-3 py-2">{conversation.role}</td>
+                      <td className="px-3 py-2">{conversation.title}</td>
+                      <td className="px-3 py-2">{conversation.messages.length}</td>
+                      <td className="px-3 py-2">{new Date(conversation.updatedAt).toLocaleString()}</td>
                       <td className="px-3 py-2">
                         <button
-                          onClick={() => setSelectedAudit(event)}
+                          onClick={() => setSelectedConversation(conversation)}
                           className="mechanical rounded-[6px] border border-[#1F1F21] px-2 py-1 text-xs"
                         >
                           View
@@ -409,6 +502,13 @@ export default function AdminPage() {
                       </td>
                     </tr>
                   ))}
+                  {!conversations.length ? (
+                    <tr>
+                      <td className="px-3 py-3 text-[#8C8C95]" colSpan={5}>
+                        No conversations recorded yet.
+                      </td>
+                    </tr>
+                  ) : null}
                 </tbody>
               </table>
             </div>
@@ -419,42 +519,37 @@ export default function AdminPage() {
           <section>
             <h2 className="mb-4 text-lg font-medium">Escalations</h2>
             <div className="space-y-3">
-              {escalationEvents.map((event) => {
-                const status = escalationStatus[event.id] ?? "Pending";
-                const expanded = expandedEscalation === event.id;
+              {tickets.map((ticket) => {
+                const status = ticket.status;
+                const expanded = expandedEscalation === ticket.id;
                 return (
-                  <div key={event.id} className="rounded-[8px] border border-[#1F1F21] bg-[#141415] p-4">
+                  <div key={ticket.id} className="rounded-[8px] border border-[#1F1F21] bg-[#141415] p-4">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
-                        <p className="text-sm">{event.question}</p>
+                        <p className="text-sm">{ticket.question}</p>
                         <p className="text-xs text-[#8C8C95]">
-                          {event.role} · {new Date(event.createdAt).toLocaleString()}
+                          {ticket.role} · {new Date(ticket.createdAt).toLocaleString()} · {ticket.id}
                         </p>
                       </div>
                       <div className="flex items-center gap-2">
                         <span
                           className={`rounded-[999px] px-2 py-1 text-[10px] ${
-                            status === "Pending"
+                            status !== "resolved"
                               ? "bg-[#2A2110] text-[#F59E0B]"
                               : "bg-[#102315] text-[#22C55E]"
                           }`}
                         >
-                          {status}
+                          {status.replace("_", " ")}
                         </span>
                         <button
-                          onClick={() =>
-                            setEscalationStatus((prev) => ({
-                              ...prev,
-                              [event.id]: "Resolved",
-                            }))
-                          }
+                          onClick={() => void updateTicket(ticket, "resolved", hrResponse[ticket.id] ?? ticket.hrResponse)}
                           className="mechanical rounded-[6px] border border-[#1F1F21] px-2 py-1 text-xs"
                         >
                           Mark Resolved
                         </button>
                         <button
                           onClick={() =>
-                            setExpandedEscalation((prev) => (prev === event.id ? null : event.id))
+                            setExpandedEscalation((prev) => (prev === ticket.id ? null : ticket.id))
                           }
                           className="mechanical rounded-[6px] border border-[#1F1F21] px-2 py-1 text-xs"
                         >
@@ -465,23 +560,80 @@ export default function AdminPage() {
 
                     {expanded ? (
                       <div className="mt-3 border-t border-[#1F1F21] pt-3">
-                        <p className="text-xs text-[#8C8C95]">Reason: {event.reason}</p>
+                        <p className="text-xs text-[#8C8C95]">Reason: {ticket.reason}</p>
+                        <p className="mt-1 text-xs text-[#8C8C95]">
+                          Notification: {(ticket.notificationStatus ?? "pending").replace("_", " ")}
+                        </p>
                         <textarea
-                          value={hrResponse[event.id] ?? ""}
+                          value={hrResponse[ticket.id] ?? ticket.hrResponse ?? ""}
                           onChange={(e) =>
                             setHrResponse((prev) => ({
                               ...prev,
-                              [event.id]: e.target.value,
+                              [ticket.id]: e.target.value,
                             }))
                           }
                           placeholder="Send HR response"
                           className="mt-2 w-full rounded-[6px] border border-[#1F1F21] bg-[#0C0C0D] px-3 py-2 text-sm"
                         />
+                        <button
+                          onClick={() => void updateTicket(ticket, "in_progress", hrResponse[ticket.id] ?? ticket.hrResponse)}
+                          className="mt-2 rounded-[6px] border border-[#1F1F21] px-3 py-1 text-xs"
+                        >
+                          Save HR Response
+                        </button>
                       </div>
                     ) : null}
                   </div>
                 );
               })}
+              {!tickets.length ? (
+                <p className="rounded-[8px] border border-[#1F1F21] bg-[#141415] p-4 text-sm text-[#8C8C95]">
+                  No persistent HR tickets yet. Legacy audit escalations: {escalationEvents.length}.
+                </p>
+              ) : null}
+            </div>
+          </section>
+        ) : null}
+
+        {activeTab === "analytics" ? (
+          <section>
+            <h2 className="mb-4 text-lg font-medium">HR Analytics & FAQs</h2>
+            <div className="mb-5 grid gap-3 sm:grid-cols-3">
+              {[
+                ["Total queries", analytics?.totalQueries ?? 0],
+                ["Escalations", analytics?.totalEscalations ?? 0],
+                ["Escalation rate", `${Math.round((analytics?.escalationRate ?? 0) * 100)}%`],
+              ].map(([label, value]) => (
+                <div key={String(label)} className="rounded-[8px] border border-[#1F1F21] bg-[#141415] p-4">
+                  <p className="text-xs text-[#8C8C95]">{label}</p>
+                  <p className="mt-2 text-2xl font-semibold">{value}</p>
+                </div>
+              ))}
+            </div>
+
+            <div className="grid gap-4 lg:grid-cols-2">
+              <div className="rounded-[8px] border border-[#1F1F21] bg-[#141415] p-4">
+                <h3 className="mb-3 text-sm font-medium">Frequently asked questions</h3>
+                <div className="space-y-2 text-sm">
+                  {(analytics?.topQuestions ?? []).map((item) => (
+                    <div key={item.question} className="flex justify-between gap-3 border-b border-[#1F1F21] pb-2">
+                      <span className="text-[#C8C8D0]">{item.question}</span>
+                      <span className="text-[#8C8C95]">{item.count}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="rounded-[8px] border border-[#1F1F21] bg-[#141415] p-4">
+                <h3 className="mb-3 text-sm font-medium">Most used policy sources</h3>
+                <div className="space-y-2 text-sm">
+                  {(analytics?.topPolicies ?? []).map((item) => (
+                    <div key={item.policy} className="flex justify-between gap-3 border-b border-[#1F1F21] pb-2">
+                      <span className="text-[#C8C8D0]">{item.policy}</span>
+                      <span className="text-[#8C8C95]">{item.count}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           </section>
         ) : null}
@@ -563,7 +715,7 @@ export default function AdminPage() {
       {showModal ? (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4">
           <div className="w-full max-w-[560px] rounded-[8px] border border-[#1F1F21] bg-[#141415] p-4">
-            <h3 className="mb-3 text-lg font-medium">Add Policy Chunk</h3>
+            <h3 className="mb-3 text-lg font-medium">{form.id ? "Edit Policy Chunk" : "Add Policy Chunk"}</h3>
             <div className="grid gap-2">
               <input
                 value={form.title}
@@ -611,6 +763,12 @@ export default function AdminPage() {
               </div>
             </div>
 
+            {formError ? (
+              <div className="mt-3 rounded-[6px] border border-[#7F1D1D] bg-[#2A1114] px-3 py-2 text-xs text-[#FCA5A5]">
+                {formError}
+              </div>
+            ) : null}
+
             <div className="mt-4 flex justify-end gap-2">
               <button
                 onClick={() => setShowModal(false)}
@@ -620,40 +778,49 @@ export default function AdminPage() {
               </button>
               <button
                 onClick={() => void upsertPolicy()}
-                className="mechanical rounded-[6px] bg-[#6366F1] px-3 py-2 text-sm"
+                disabled={savingPolicy}
+                className="mechanical rounded-[6px] bg-[#6366F1] px-3 py-2 text-sm disabled:opacity-60"
               >
-                Save Chunk
+                {savingPolicy ? "Saving..." : "Save Chunk"}
               </button>
             </div>
           </div>
         </div>
       ) : null}
 
-      {selectedAudit ? (
-        <div className="fixed inset-y-0 right-0 z-50 w-full max-w-[480px] border-l border-[#1F1F21] bg-[#141415] p-4">
+      {selectedConversation ? (
+        <div className="fixed inset-y-0 right-0 z-50 flex w-full max-w-[520px] flex-col border-l border-[#1F1F21] bg-[#141415] p-4">
           <div className="mb-3 flex items-center justify-between">
             <h3 className="text-base font-medium">Conversation Detail</h3>
             <button
-              onClick={() => setSelectedAudit(null)}
+              onClick={() => setSelectedConversation(null)}
               className="mechanical rounded-[6px] border border-[#1F1F21] px-2 py-1 text-xs"
             >
               Close
             </button>
           </div>
 
-          <div className="space-y-3 text-sm">
-            <p>
-              <span className="text-[#8C8C95]">Role:</span> {selectedAudit.role}
-            </p>
-            <p>
-              <span className="text-[#8C8C95]">Question:</span> {selectedAudit.question}
-            </p>
-            <p>
-              <span className="text-[#8C8C95]">Date:</span> {new Date(selectedAudit.createdAt).toLocaleString()}
-            </p>
-            <p className="mono rounded-[6px] border border-[#1F1F21] bg-[#0C0C0D] p-3 text-xs text-[#B7B7C0]">
-              Metadata: {JSON.stringify(selectedAudit.metadata ?? {}, null, 2)}
-            </p>
+          <p className="mb-3 text-xs text-[#8C8C95]">
+            {selectedConversation.role} · started {new Date(selectedConversation.createdAt).toLocaleString()} · {selectedConversation.id}
+          </p>
+
+          <div className="flex-1 space-y-3 overflow-y-auto text-sm">
+            {selectedConversation.messages.map((message) => (
+              <div
+                key={message.id}
+                className={`rounded-[6px] border p-3 ${
+                  message.role === "user"
+                    ? "border-[#2D2D3F] bg-[#1E1E2E]"
+                    : "border-[#1F1F21] bg-[#0C0C0D]"
+                }`}
+              >
+                <p className="mb-1 text-[10px] uppercase tracking-wide text-[#8C8C95]">
+                  {message.role === "user" ? "Employee" : "Assistant"}
+                  {message.escalated ? " · escalated" : ""}
+                </p>
+                <p className="whitespace-pre-wrap text-[#D4D4DA]">{message.content}</p>
+              </div>
+            ))}
           </div>
         </div>
       ) : null}

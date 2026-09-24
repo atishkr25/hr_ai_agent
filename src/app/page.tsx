@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 
 const demoQuestion = "How many days of annual leave do I get in my first year?";
 const demoAnswer =
-  "You are entitled to 21 annual leave days per calendar year after probation. [Policy: Annual Leave Policy, Section: 3.2 Entitlement, Page: 14]";
+  "You are entitled to 21 annual leave days per calendar year after probation. [Policy: Annual Leave Policy, Section: 3.2 Entitlement, Page: 12]";
 
 export default function Home() {
   const [typedQuestion, setTypedQuestion] = useState("");

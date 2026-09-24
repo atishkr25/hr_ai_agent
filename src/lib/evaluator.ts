@@ -86,10 +86,11 @@ export async function runEvaluation(
         headers: {
           "Content-Type": "application/json",
           "x-user-role": evalCase.role,
+          "x-eval-run": "true",
         },
         body: JSON.stringify({
           query: evalCase.query,
-          conversationId: "eval-suite",
+          conversationId: `eval_${evalCase.id}_${Date.now()}`,
         }),
       });
 
